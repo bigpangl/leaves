@@ -168,9 +168,9 @@ class Leaf(object):
     connection = None
     func = None
     prefetch_count: int
-    timeout: int = 0
+    timeout: int = None
 
-    def __init__(self, branch: Branch, prefetch_count: int = 1, timeout: int = 0, *args, **kwargs):
+    def __init__(self, branch: Branch, prefetch_count: int = 1, timeout: int = None, *args, **kwargs):
         self.branch = branch
         self.prefetch_count = prefetch_count
         self.timeout = timeout
@@ -216,7 +216,9 @@ class Leaf(object):
         await message.channel.basic_ack(message.delivery.delivery_tag)  # 确定回发成功后,再执行ack
 
     async def on_response(self, message: aiormq.types.DeliveredMessage):
+        logger.debug(f"接收任务并即将调用函数:{self.branch.name}.{self.func.__name__}")
         await self.call_back(message, self.func)
+        logger.debug(f"执行完毕:{self.branch.name}.{self.func.__name__}")
 
     def registe_func(self, func):
         self.func = func
@@ -264,18 +266,6 @@ class MicroContainer(object):
         for branch in self.branchs:
             branch: Branch
             await branch.start(self.con_url)
-
-        # connection = await aiormq.connect(self.con_url)
-        # channel = await connection.channel()
-        # await channel.basic_qos(prefetch_count=self.prefetch_count)  # 限制同时接受的任务数
-        # # 发布任务端核定,exchange 和 queue 都不应该断开链接自动删除
-        # for leaf in self.leaves:
-        #     leaf: Leaf
-        #     await channel.exchange_declare(exchange=leaf.name)
-        #     for key, func in leaf.method.items():
-        #         declare_ok = await channel.queue_declare(key, durable=True)  # 队列需要持久化用于接受所有的任务
-        #         await channel.queue_bind(exchange=leaf.name, routing_key=key, queue=key)
-        #         await channel.basic_consume(declare_ok.queue, func)
 
     def run(self):
         asyncio.ensure_future(self.service_publish())

@@ -11,7 +11,7 @@ description = "基于rabbitmq的轻量级rpc调用封装"
 
 setup(
     name='leaves',
-    version="0.1.5",
+    version="0.2.2",
     description=description,
     long_description=description,
     author="bigpangl",
