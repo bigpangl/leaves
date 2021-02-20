@@ -24,10 +24,6 @@ async def main():
         rpc: RPC
         data = await rpc.points.hello("test", a="345")
         print(data)
-    async with RPC(con_url="amqp://") as rpc:
-        rpc: RPC
-        data = await rpc.kinds.call("test", a="345")
-        print(data)
     print("结束")
 
 
@@ -40,26 +36,19 @@ asyncio.get_event_loop().run_forever()
 
 ```python
 
-import asyncio
-from leaves import Leaf, MicroContainer
+from leaves import Leaf, Branch, MicroContainer
 
-leaf = Leaf("points")
-leaf2 = Leaf("kinds")
+branch = Branch("points")
 
 
-@leaf.rpc(timeout=10)
+@Branch.leaf(timeout=10)
 async def hello(*args, **kwargs):
     print("函数被调用了")
     return 1
 
 
-@leaf2.rpc()
-async def call(*args, **kwargs):
-    return "call"
-
-
 if __name__ == '__main__':
-    container = MicroContainer([leaf, leaf2], con_url=r"amqp://")
+    container = MicroContainer([branch], con_url=r"amqp://")
 
     container.run()
 

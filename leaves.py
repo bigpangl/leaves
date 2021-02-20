@@ -8,9 +8,7 @@ import json
 import uuid
 import asyncio
 import logging
-import multiprocessing
-import concurrent.futures
-from typing import Dict, List
+from typing import List
 
 import aiormq
 import pamqp
@@ -125,51 +123,57 @@ class RPC(object):
 
 
 # 消费者端发布
+class Branch(object):
+    """
+
+    寓意为树枝,其上可以拥有多个树叶,每个树叶当表示一个函数调用
+
+    一个树枝内的树叶将共用一个tcp链接,基于不同的channel实现
+
+    所以对于任务的并发,可以通过leaf的设置实现，是基于单个函数的控制实现的
+
+    """
+
+    name: str = ""
+    leaves: List
+
+    def __init__(self, name: str):
+        self.name = name
+        self.leaves = []  # 存放所有的树叶
+
+    def leaf(self, *args, **kwargs):
+        _leaf = Leaf(self, *args, **kwargs)
+
+        return _leaf.registe_func
+
+    async def start(self, con_url: str):
+        """
+        去让所有的叶片开始队列监听功能
+        :param con_url:
+        :return:
+        """
+
+        connection = await aiormq.connect(con_url)
+        for leaf in self.leaves:
+            leaf: Leaf
+            leaf.connection = connection
+            await leaf.start()
 
 
 class Leaf(object):
     """
     单个用于存放处理函数的叶片
     """
-
-    name: str = None
-    method: Dict = None
-
-    def __init__(self, name: str):
-        self.name = name
-        self.method = {}
-
-    def rpc(self, *args, **kwargs):
-        texture = Texture(self, *args, **kwargs)
-        return texture.register
-
-
-class Texture(object):
-    """
-
-    单个函数的注册
-
-    """
-    leaf: Leaf = None
+    branch: Branch = None
+    connection = None
     func = None
-    timeout: int = None
+    prefetch_count: int
+    timeout: int = 0
 
-    def __init__(self, leaf: Leaf, timeout: int = None):
-        self.leaf = leaf
+    def __init__(self, branch: Branch, prefetch_count: int = 1, timeout: int = 0, *args, **kwargs):
+        self.branch = branch
+        self.prefetch_count = prefetch_count
         self.timeout = timeout
-
-    async def on_response(self, message: aiormq.types.DeliveredMessage):
-        await self.call_back(message, self.func)
-
-    def register(self, func):
-        func_name = func.__name__
-        self.func = func
-        self.leaf.method[func_name] = self.on_response
-
-        async def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
-
-        return wrapper
 
     async def call_back(self, message: aiormq.types.DeliveredMessage, func):
         """
@@ -197,16 +201,46 @@ class Texture(object):
             "status": status,
             "result": data
         }
+        if message.header.properties.reply_to:
+            try:
+                await message.channel.basic_publish(
+                    json.dumps(back_data).encode(),
+                    routing_key=message.header.properties.reply_to,
+                    properties=aiormq.spec.Basic.Properties(
+                        correlation_id=message.header.properties.correlation_id
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"回发任务时发生错误：{e}")
 
-        await message.channel.basic_ack(message.delivery.delivery_tag)
+        await message.channel.basic_ack(message.delivery.delivery_tag)  # 确定回发成功后,再执行ack
 
-        await message.channel.basic_publish(
-            json.dumps(back_data).encode(),
-            routing_key=message.header.properties.reply_to,
-            properties=aiormq.spec.Basic.Properties(
-                correlation_id=message.header.properties.correlation_id
-            ),
-        )
+    async def on_response(self, message: aiormq.types.DeliveredMessage):
+        await self.call_back(message, self.func)
+
+    def registe_func(self, func):
+        self.func = func
+
+        # self.branch.leaves[func_name] = self.on_response
+        self.branch.leaves.append(self)
+
+        async def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    async def start(self):
+        """
+        让每个叶片都独立起飞？
+        :return:
+        """
+        logger.debug(f"监听:exchanges:{self.branch.name},queue:{self.func.__name__}")
+        channel = await self.connection.channel()
+        await channel.basic_qos(prefetch_count=self.prefetch_count)  # 限制同时接受的任务数
+        await channel.exchange_declare(exchange=self.branch.name)
+        declare_ok = await channel.queue_declare(self.func.__name__, durable=True)  # 队列需要持久化用于接受所有的任务
+        await channel.queue_bind(exchange=self.branch.name, routing_key=self.func.__name__, queue=self.func.__name__)
+        await channel.basic_consume(declare_ok.queue, self.on_response)
 
 
 class MicroContainer(object):
@@ -215,38 +249,33 @@ class MicroContainer(object):
     单个节点运行的容器
 
     """
-    leaves: List[Leaf] = None
+    branchs: List[Branch] = None
     con_url: str = ""
-    prefetch_count: int = 1
 
-    def __init__(self, leaves: List[Leaf], con_url: str, prefetch_count: int = 1, executor=None):
-        self.leaves = leaves
+    def __init__(self, branchs: List[Branch], con_url: str):
+        self.branchs = branchs
         self.con_url = con_url
-        self.prefetch_count = prefetch_count
-        if executor is None:
-            max_workers = max(multiprocessing.cpu_count() - 1, 1)
-            logger.info(f"loop default executor max_workers:{max_workers}")
-            executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
-        loop = asyncio.get_event_loop()
-        loop.set_default_executor(executor)
 
     async def service_publish(self):
         """
         关于初始化任务监听部分的工作,可以定制
         :return:
         """
+        for branch in self.branchs:
+            branch: Branch
+            await branch.start(self.con_url)
 
-        connection = await aiormq.connect(self.con_url)
-        channel = await connection.channel()
-        await channel.basic_qos(prefetch_count=self.prefetch_count)  # 限制同时接受的任务数
-        # 发布任务端核定,exchange 和 queue 都不应该断开链接自动删除
-        for leaf in self.leaves:
-            leaf: Leaf
-            await channel.exchange_declare(exchange=leaf.name)
-            for key, func in leaf.method.items():
-                declare_ok = await channel.queue_declare(key, durable=True)  # 队列需要持久化用于接受所有的任务
-                await channel.queue_bind(exchange=leaf.name, routing_key=key, queue=key)
-                await channel.basic_consume(declare_ok.queue, func)
+        # connection = await aiormq.connect(self.con_url)
+        # channel = await connection.channel()
+        # await channel.basic_qos(prefetch_count=self.prefetch_count)  # 限制同时接受的任务数
+        # # 发布任务端核定,exchange 和 queue 都不应该断开链接自动删除
+        # for leaf in self.leaves:
+        #     leaf: Leaf
+        #     await channel.exchange_declare(exchange=leaf.name)
+        #     for key, func in leaf.method.items():
+        #         declare_ok = await channel.queue_declare(key, durable=True)  # 队列需要持久化用于接受所有的任务
+        #         await channel.queue_bind(exchange=leaf.name, routing_key=key, queue=key)
+        #         await channel.basic_consume(declare_ok.queue, func)
 
     def run(self):
         asyncio.ensure_future(self.service_publish())
