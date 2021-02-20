@@ -41,7 +41,7 @@ from leaves import Leaf, Branch, MicroContainer
 branch = Branch("points")
 
 
-@Branch.leaf(timeout=10)
+@branch.leaf(timeout=10)
 async def hello(*args, **kwargs):
     print("函数被调用了")
     return 1
