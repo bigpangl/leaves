@@ -182,10 +182,13 @@ class Leaf(object):
         :param func:
         :return:
         """
-
-        body = json.loads(message.body)
-        args = body["args"]
-        kwargs = body["kwargs"]
+        try:
+            body = json.loads(message.body)
+        except Exception as e:
+            logger.error(f"数据接收异常,无法正常转换json，{e},{message.body}")
+            body = {}
+        args = body.get("args", [])
+        kwargs = body.get("kwargs", {})
         status = True
         try:
             data = await asyncio.wait_for(func(*args, **kwargs), timeout=self.timeout)
@@ -201,6 +204,7 @@ class Leaf(object):
             "status": status,
             "result": data
         }
+
         if message.header.properties.reply_to:
             try:
                 await message.channel.basic_publish(
