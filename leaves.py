@@ -238,7 +238,7 @@ class Leaf(object):
         self.branch.leaves.append(self)
 
         async def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
+            return await func(*args, **kwargs)
 
         return wrapper
 
