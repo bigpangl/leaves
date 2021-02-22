@@ -8,7 +8,7 @@ import json
 import uuid
 import asyncio
 import logging
-from typing import List
+from typing import List, Union
 
 import aiormq
 import pamqp
@@ -100,20 +100,26 @@ class Method(object):
 class RPC(object):
     """
     顶层rpc 调用,供客户端使用
+
+    支持从外部传入connection,为后续做连接池防止并发导致的大量链接做准备
     """
 
-    con_url: str = ""
+    con_url: Union[str, aiormq.connection.Connection] = ""
     connection: aiormq.connection.Connection = None
 
-    def __init__(self, con_url: str):
+    def __init__(self, con_url: Union[str, aiormq.connection.Connection]):
         self.con_url = con_url
 
     async def __aenter__(self):
-        self.connection = await aiormq.connect(self.con_url)
+        if isinstance(self.con_url, str):
+            self.connection = await aiormq.connect(self.con_url)
+        else:
+            self.connection = self.con_url
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.connection.close()
+        if isinstance(self.con_url, str):
+            await self.connection.close()
 
     def __getattr__(self, item):
         server = Service()
