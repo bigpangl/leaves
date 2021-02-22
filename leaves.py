@@ -220,6 +220,9 @@ class Leaf(object):
                         correlation_id=message.header.properties.correlation_id
                     ),
                 )
+
+                logger.debug(f"成功向队列:{message.header.properties.reply_to} 回发任务结果,"
+                             f"correlation_id:{message.header.properties.correlation_id}")
             except Exception as e:
                 logger.error(f"回发任务时发生错误：{e}")
         else:
