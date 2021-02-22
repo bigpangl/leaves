@@ -216,7 +216,8 @@ class Leaf(object):
                 )
             except Exception as e:
                 logger.error(f"回发任务时发生错误：{e}")
-
+        else:
+            logger.warning(f"未指定rpc 任务回发队列,将不进行结果回传")
         await message.channel.basic_ack(message.delivery.delivery_tag)  # 确定回发成功后,再执行ack
 
     async def on_response(self, message: aiormq.types.DeliveredMessage):
