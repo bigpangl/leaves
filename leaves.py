@@ -142,15 +142,23 @@ class Branch(object):
 
     name: str = ""
     leaves: List
+    con_url: str
+    _connection: aiormq.connection.Connection
 
     def __init__(self, name: str):
         self.name = name
         self.leaves = []  # 存放所有的树叶
+        self.con_url = ""
 
     def leaf(self, *args, **kwargs):
         _leaf = Leaf(self, *args, **kwargs)
 
         return _leaf.registe_func
+
+    async def on_stop(self, *args, **kwargs):
+        # 试着当链接断开时,重新建立链接,并重新监听各自的队列,此处功能未寻找到合适机会测试
+        logger.warning(f"rabbitmq 断开了链接:{args},{kwargs}")
+        asyncio.ensure_future(self.start(self.con_url))
 
     async def start(self, con_url: str):
         """
@@ -159,10 +167,12 @@ class Branch(object):
         :return:
         """
 
-        connection = await aiormq.connect(con_url)
+        self._connection: aiormq.connection.Connection = await aiormq.connect(con_url)
+        self._connection.closing.add_done_callback(self.on_stop)
+
         for leaf in self.leaves:
             leaf: Leaf
-            leaf.connection = connection
+            leaf.connection = self._connection
             await leaf.start()
 
 
@@ -251,7 +261,8 @@ class Leaf(object):
         :return:
         """
         logger.debug(f"监听:exchanges:{self.branch.name},queue:{self.func.__name__}")
-        channel = await self.connection.channel()
+        channel: aiormq.channel.Channel = await self.connection.channel()
+
         await channel.basic_qos(prefetch_count=self.prefetch_count)  # 限制同时接受的任务数
         await channel.exchange_declare(exchange=self.branch.name)
         declare_ok = await channel.queue_declare(self.func.__name__, durable=True)  # 队列需要持久化用于接受所有的任务
