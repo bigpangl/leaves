@@ -14,7 +14,7 @@ with open("README.rst", "r", encoding="utf8") as f:
 
 setup(
     name='leaves',
-    version="0.2.10",
+    version="0.3.1",
     description=description,
     long_description=long_description,
     author="bigpangl",
@@ -22,7 +22,7 @@ setup(
     url='https://github.com/bigpangl/leaves',
     py_modules=['leaves'],
     install_requires=[
-        "aiormq"
+        "aio-pika"
     ],
     include_package_data=True,
     keywords='rpc',

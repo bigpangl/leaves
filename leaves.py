@@ -257,7 +257,6 @@ class Leaf(object):
         )
         queue = await channel.declare_queue(self.func.__name__, durable=True)  # 队列需要持久化用于接受所有的任务
         await queue.bind(direct_logs_exchange, routing_key=self.func.__name__)
-        await queue.bind(direct_logs_exchange, routing_key=self.branch.name)  # 绑定处理
 
         await queue.consume(self.on_response)
 
