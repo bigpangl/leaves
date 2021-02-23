@@ -6,12 +6,14 @@ Python:     python3.6
 """
 import json
 import uuid
+import traceback
 import asyncio
 import logging
 from typing import List, Union
 
+import aio_pika
 import aiormq
-import pamqp
+from pamqp import specification as spec
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 class Service(object):
     name: str = None
-    connection: aiormq.connection.Connection = None
+    connection: aio_pika.connection.Connection = None
 
     def __getattr__(self, item):
         method = Method()
@@ -35,23 +37,20 @@ class Method(object):
     rpc 调用端使用
     """
     name: str = None
-    connection: aiormq.connection.Connection = None
-    channel: aiormq.channel.Channel = None
+    connection: aio_pika.connection.Connection = None
+    channel: aio_pika.channel.Channel = None
     service: Service = None
     future = None
 
-    async def on_callback(self, message: aiormq.types.DeliveredMessage):
+    async def on_callback(self, message: aio_pika.IncomingMessage):
         """
         等待异步的结果
         :param message:
         :return:
         """
-        try:
-            await message.channel.basic_ack(message.delivery.delivery_tag)
-        except Exception as e:
-            logger.error(f"等待结果后ack 消息时失败:{e}")
-
-        self.future.set_result(json.loads(message.body))
+        logger.debug(f"接受到回调消息:{json.loads(message.body)}")
+        with message.process():
+            self.future.set_result(json.loads(message.body))
 
     async def __call__(self, *args, **kwargs):
         """
@@ -64,31 +63,31 @@ class Method(object):
         correlation_id = str(uuid.uuid4())  # 随机ID
 
         self.channel = await self.connection.channel()  # 每次调用都将复用connection 新建channel
-        declare_ok: pamqp.commands.Queue.DeclareOk = await self.channel.queue_declare(
-            f"leaves_{self.name}_{correlation_id}",
-            exclusive=True,  # auto_delete=True, # exclusive已经将自动删除
-        )
+        async with self.channel:
+            queue = await self.channel.declare_queue(f"leaves_{self.name}_{correlation_id}", exclusive=True)
+            logger.debug(f"建立结果监听队列:{queue}")
 
-        await self.channel.basic_consume(declare_ok.queue, self.on_callback)
+            await queue.consume(self.on_callback)  # 注册函数而非一直等待
 
-        data = {"args": args, "kwargs": kwargs}
+            data = {"args": args, "kwargs": kwargs}
+            self.future = asyncio.get_event_loop().create_future()
 
-        self.future = asyncio.get_event_loop().create_future()
+            logger.debug(f"准备向交换机:{self.service.name} 下 {self.name} 队列,发送数据:{data}")
 
-        await self.channel.basic_publish(
-            json.dumps(data).encode(),
-            exchange=self.service.name,
-            routing_key=self.name,
-            properties=aiormq.spec.Basic.Properties(
-                content_type='text/plain',
-                correlation_id=correlation_id,
-                reply_to=declare_ok.queue,
+            direct_exchange = await self.channel.declare_exchange(
+                self.service.name, aio_pika.ExchangeType.DIRECT
             )
-        )  # 结果接受队列创建完毕后再发布任务
 
-        back = await self.future
+            await direct_exchange.publish(
+                aio_pika.Message(
+                    json.dumps(data).encode(),
+                    correlation_id=correlation_id,
+                    reply_to=queue.name
+                ),
+                routing_key=self.name,
+            )
 
-        await self.channel.close()  # 关闭channel 并将删除独占的队列
+            back = await self.future
 
         if back["status"]:
             return back["result"]
@@ -105,14 +104,14 @@ class RPC(object):
     """
 
     con_url: Union[str, aiormq.connection.Connection] = ""
-    connection: aiormq.connection.Connection = None
+    connection: aio_pika.connection.Connection = None
 
     def __init__(self, con_url: Union[str, aiormq.connection.Connection]):
         self.con_url = con_url
 
     async def __aenter__(self):
         if isinstance(self.con_url, str):
-            self.connection = await aiormq.connect(self.con_url)
+            self.connection = await aio_pika.connect(self.con_url)
         else:
             self.connection = self.con_url
         return self
@@ -143,7 +142,7 @@ class Branch(object):
     name: str = ""
     leaves: List
     con_url: str
-    _connection: aiormq.connection.Connection
+    _connection: aio_pika.connection.Connection
 
     def __init__(self, name: str):
         self.name = name
@@ -155,11 +154,6 @@ class Branch(object):
 
         return _leaf.registe_func
 
-    async def on_stop(self, *args, **kwargs):
-        # 试着当链接断开时,重新建立链接,并重新监听各自的队列,此处功能未寻找到合适机会测试
-        logger.warning(f"rabbitmq 断开了链接:{args},{kwargs}")
-        asyncio.ensure_future(self.start(self.con_url))
-
     async def start(self, con_url: str):
         """
         去让所有的叶片开始队列监听功能
@@ -167,13 +161,12 @@ class Branch(object):
         :return:
         """
 
-        self._connection: aiormq.connection.Connection = await aiormq.connect(con_url)
-        self._connection.closing.add_done_callback(self.on_stop)
+        self._connection = await aio_pika.connect_robust(con_url)  # 此种用法支持自动重连并注册函数
 
         for leaf in self.leaves:
             leaf: Leaf
             leaf.connection = self._connection
-            await leaf.start()
+            asyncio.ensure_future(leaf.start())
 
 
 class Leaf(object):
@@ -181,7 +174,7 @@ class Leaf(object):
     单个用于存放处理函数的叶片
     """
     branch: Branch = None
-    connection = None
+    connection: aio_pika.connection.Connection = None
     func = None
     prefetch_count: int
     timeout: int = None
@@ -191,63 +184,58 @@ class Leaf(object):
         self.prefetch_count = prefetch_count
         self.timeout = timeout
 
-    async def call_back(self, message: aiormq.types.DeliveredMessage, func):
-        """
-        常规调用，未增加新开线程or 进程调用
-        :param message:
-        :param func:
-        :return:
-        """
-        try:
-            body = json.loads(message.body)
-        except Exception as e:
-            logger.error(f"数据接收异常,无法正常转换json，{e},{message.body}")
+    async def on_response(self, message: aio_pika.IncomingMessage):
+
+        logger.debug(f"即将调用函数:{self.branch.name}.{self.func.__name__}:{message.body}")
+
+        with message.process():
             body = {}
-        args = body.get("args", [])
-        kwargs = body.get("kwargs", {})
-        status = True
-        try:
-            data = await asyncio.wait_for(func(*args, **kwargs), timeout=self.timeout)
-        except asyncio.TimeoutError:
-            data = "计算超时"
-            status = False
-        except Exception as e:
-            logger.error(f"执行函数{func.__name__}时发生错误:{e}")
-            data = f"{e}"
-            status = False
-
-        back_data = {
-            "status": status,
-            "result": data
-        }
-
-        if message.header.properties.reply_to:
             try:
-                await message.channel.basic_publish(
-                    json.dumps(back_data).encode(),
-                    routing_key=message.header.properties.reply_to,
-                    properties=aiormq.spec.Basic.Properties(
-                        correlation_id=message.header.properties.correlation_id
-                    ),
-                )
-
-                logger.debug(f"成功向队列:{message.header.properties.reply_to} 回发任务结果,"
-                             f"correlation_id:{message.header.properties.correlation_id}")
+                body = json.loads(message.body)
             except Exception as e:
-                logger.error(f"回发任务时发生错误：{e}")
-        else:
-            logger.warning(f"未指定rpc 任务回发队列,将不进行结果回传")
-        await message.channel.basic_ack(message.delivery.delivery_tag)  # 确定回发成功后,再执行ack
+                logger.error(f"数据接收异常,无法正常转换json，{e},{message.body}")
 
-    async def on_response(self, message: aiormq.types.DeliveredMessage):
-        logger.debug(f"接收任务并即将调用函数:{self.branch.name}.{self.func.__name__}")
-        await self.call_back(message, self.func)
-        logger.debug(f"执行完毕:{self.branch.name}.{self.func.__name__}")
+            args = body.get("args", [])
+            kwargs = body.get("kwargs", {})
+            status = True
+            try:
+                data = await asyncio.wait_for(self.func(*args, **kwargs), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                data = "计算超时"
+                status = False
+            except Exception as e:
+                logger.error(f"执行函数{self.func.__name__}时发生错误:{e},{traceback.format_exc()}")
+                data = f"{e}"
+                status = False
+
+            back_data = {
+                "status": status,
+                "result": data
+            }
+
+            if message.reply_to:
+                try:
+                    await message.channel.basic_publish(
+                        body=json.dumps(back_data).encode(),
+                        routing_key=message.reply_to,
+                        properties=spec.Basic.Properties(
+                            correlation_id=message.correlation_id
+                        )
+                    )
+                    logger.debug(f"成功向队列:{message.reply_to} 回发任务结果,"
+                                 f"correlation_id:{message.correlation_id}")
+                except Exception as e:
+                    logger.error(f"回发任务时发生错误：{e},\r\n {traceback.format_exc()}")
+                    raise e
+            else:
+                logger.warning(f"未指定rpc 任务回发队列,将不进行结果回传")
+
+            logger.debug(f"执行完毕:{self.branch.name}.{self.func.__name__}")
+        logger.debug(f"消息ack:{self.branch.name}.{self.func.__name__}")
 
     def registe_func(self, func):
         self.func = func
 
-        # self.branch.leaves[func_name] = self.on_response
         self.branch.leaves.append(self)
 
         async def wrapper(*args, **kwargs):
@@ -261,13 +249,17 @@ class Leaf(object):
         :return:
         """
         logger.debug(f"监听:exchanges:{self.branch.name},queue:{self.func.__name__}")
-        channel: aiormq.channel.Channel = await self.connection.channel()
+        channel: aio_pika.channel.Channel = await self.connection.channel()
+        await channel.set_qos(prefetch_count=self.prefetch_count)
 
-        await channel.basic_qos(prefetch_count=self.prefetch_count)  # 限制同时接受的任务数
-        await channel.exchange_declare(exchange=self.branch.name)
-        declare_ok = await channel.queue_declare(self.func.__name__, durable=True)  # 队列需要持久化用于接受所有的任务
-        await channel.queue_bind(exchange=self.branch.name, routing_key=self.func.__name__, queue=self.func.__name__)
-        await channel.basic_consume(declare_ok.queue, self.on_response)
+        direct_logs_exchange = await channel.declare_exchange(
+            self.branch.name, aio_pika.ExchangeType.DIRECT
+        )
+        queue = await channel.declare_queue(self.func.__name__, durable=True)  # 队列需要持久化用于接受所有的任务
+        await queue.bind(direct_logs_exchange, routing_key=self.func.__name__)
+        await queue.bind(direct_logs_exchange, routing_key=self.branch.name)  # 绑定处理
+
+        await queue.consume(self.on_response)
 
 
 class MicroContainer(object):
