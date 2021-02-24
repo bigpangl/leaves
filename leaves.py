@@ -178,11 +178,14 @@ class Leaf(object):
     func = None
     prefetch_count: int
     timeout: int = None
+    another_name: str
 
-    def __init__(self, branch: Branch, prefetch_count: int = 1, timeout: int = None, *args, **kwargs):
+    def __init__(self, branch: Branch, prefetch_count: int = 1, timeout: int = None, another_name: str = None, *args,
+                 **kwargs):
         self.branch = branch
         self.prefetch_count = prefetch_count
         self.timeout = timeout
+        self.another_name = another_name
 
     async def on_response(self, message: aio_pika.IncomingMessage):
 
@@ -231,7 +234,6 @@ class Leaf(object):
                 logger.warning(f"未指定rpc 任务回发队列,将不进行结果回传")
 
             logger.debug(f"执行完毕:{self.branch.name}.{self.func.__name__}")
-        logger.debug(f"消息ack:{self.branch.name}.{self.func.__name__}")
 
     def registe_func(self, func):
         self.func = func
@@ -248,15 +250,19 @@ class Leaf(object):
         让每个叶片都独立起飞？
         :return:
         """
-        logger.debug(f"监听:exchanges:{self.branch.name},queue:{self.func.__name__}")
+        queue_name = self.func.__name__ if self.another_name is None else self.another_name
+        logger.debug(f"监听:exchanges:{self.branch.name},queue:{queue_name}")
+
         channel: aio_pika.channel.Channel = await self.connection.channel()
         await channel.set_qos(prefetch_count=self.prefetch_count)
 
         direct_logs_exchange = await channel.declare_exchange(
             self.branch.name, aio_pika.ExchangeType.DIRECT
         )
-        queue = await channel.declare_queue(self.func.__name__, durable=True)  # 队列需要持久化用于接受所有的任务
-        await queue.bind(direct_logs_exchange, routing_key=self.func.__name__)
+
+
+        queue = await channel.declare_queue(queue_name, durable=True)  # 队列需要持久化用于接受所有的任务
+        await queue.bind(direct_logs_exchange, routing_key=queue_name)
 
         await queue.consume(self.on_response)
 

@@ -14,7 +14,7 @@ with open("README.rst", "r", encoding="utf8") as f:
 
 setup(
     name='leaves',
-    version="0.3.1",
+    version="0.3.2",
     description=description,
     long_description=long_description,
     author="bigpangl",
