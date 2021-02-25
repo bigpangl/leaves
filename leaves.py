@@ -9,7 +9,7 @@ import uuid
 import traceback
 import asyncio
 import logging
-from typing import List, Union
+from typing import List, Union, Dict
 
 import aio_pika
 import aiormq
@@ -180,12 +180,24 @@ class Leaf(object):
     timeout: int = None
     another_name: str
 
-    def __init__(self, branch: Branch, prefetch_count: int = 1, timeout: int = None, another_name: str = None, *args,
-                 **kwargs):
+    durable: bool
+    exclusive: bool
+
+    args: List
+    kwargs: Dict
+
+    def __init__(self, branch: Branch, timeout: int = None, another_name: str = None,
+                 prefetch_count: int = 1, durable=True, exclusive=False,
+                 *args, **kwargs):
+
         self.branch = branch
         self.prefetch_count = prefetch_count
         self.timeout = timeout
         self.another_name = another_name
+        self.durable = durable
+        self.exclusive = exclusive
+        self.args = args
+        self.kwargs = kwargs
 
     async def on_response(self, message: aio_pika.IncomingMessage):
 
@@ -260,8 +272,9 @@ class Leaf(object):
             self.branch.name, aio_pika.ExchangeType.DIRECT
         )
 
-
-        queue = await channel.declare_queue(queue_name, durable=True)  # 队列需要持久化用于接受所有的任务
+        # 队列默认需要持久化用于接受所有的任务
+        queue = await channel.declare_queue(queue_name, durable=self.durable,
+                                            exclusive=self.exclusive, *self.args, **self.kwargs)
         await queue.bind(direct_logs_exchange, routing_key=queue_name)
 
         await queue.consume(self.on_response)
