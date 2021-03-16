@@ -23,12 +23,16 @@ logger = logging.getLogger(__name__)
 class Service(object):
     name: str = None
     connection: aio_pika.connection.Connection = None
+    method_cls = None
+
+    def __init__(self, name: str, connection, method_cls=None):
+        self.name = name
+        self.connection = connection
+        self.method_cls = method_cls if method_cls is not None else Method
 
     def __getattr__(self, item):
-        method = Method()
-        method.name = item
-        method.connection = self.connection
-        method.service = self
+        method = self.method_cls(item, self.connection, self)
+
         return method
 
 
@@ -41,6 +45,11 @@ class Method(object):
     channel: aio_pika.channel.Channel = None
     service: Service = None
     future = None
+
+    def __init__(self, name, connection, service):
+        self.name = name
+        self.connection = connection
+        self.service = service
 
     async def on_callback(self, message: aio_pika.IncomingMessage):
         """
@@ -105,9 +114,11 @@ class RPC(object):
 
     con_url: Union[str, aiormq.connection.Connection] = ""
     connection: aio_pika.connection.Connection = None
+    service_cls = None
 
-    def __init__(self, con_url: Union[str, aiormq.connection.Connection]):
+    def __init__(self, con_url: Union[str, aiormq.connection.Connection], service_cls=None):
         self.con_url = con_url
+        self.service_cls = service_cls if service_cls is not None else Service
 
     async def __aenter__(self):
         if isinstance(self.con_url, str):
@@ -121,9 +132,7 @@ class RPC(object):
             await self.connection.close()
 
     def __getattr__(self, item):
-        server = Service()
-        server.name = item
-        server.connection = self.connection
+        server = self.service_cls(item, self.connection)
         return server
 
 
@@ -141,27 +150,31 @@ class Branch(object):
 
     name: str = ""
     leaves: List
-    con_url: str
+    con_url = None
     _connection: aio_pika.connection.Connection
+    leaf_cls = None
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, con_url, leaf_cls=None):
         self.name = name
         self.leaves = []  # 存放所有的树叶
-        self.con_url = ""
+        self.con_url = con_url
+        self.leaf_cls = leaf_cls if leaf_cls is not None else Leaf
 
     def leaf(self, *args, **kwargs):
-        _leaf = Leaf(self, *args, **kwargs)
+        _leaf = self.leaf_cls(self, *args, **kwargs)
 
         return _leaf.registe_func
 
-    async def start(self, con_url: str):
+    async def start(self):
         """
         去让所有的叶片开始队列监听功能
         :param con_url:
         :return:
         """
-
-        self._connection = await aio_pika.connect_robust(con_url)  # 此种用法支持自动重连并注册函数
+        if isinstance(self.con_url, str):
+            self._connection = await aio_pika.connect_robust(self.con_url)  # 此种用法支持自动重连并注册函数
+        else:
+            self._connection = self.con_url  # not str
 
         for leaf in self.leaves:
             leaf: Leaf
@@ -180,22 +193,17 @@ class Leaf(object):
     timeout: int = None
     another_name: str
 
-    durable: bool
-    exclusive: bool
-
-    args: List
+    args = None
     kwargs: Dict
 
     def __init__(self, branch: Branch, timeout: int = None, another_name: str = None,
-                 prefetch_count: int = 1, durable=True, exclusive=False,
-                 *args, **kwargs):
+                 prefetch_count: int = 1, *args, **kwargs):
 
         self.branch = branch
         self.prefetch_count = prefetch_count
         self.timeout = timeout
         self.another_name = another_name
-        self.durable = durable
-        self.exclusive = exclusive
+
         self.args = args
         self.kwargs = kwargs
 
@@ -273,8 +281,7 @@ class Leaf(object):
         )
 
         # 队列默认需要持久化用于接受所有的任务
-        queue = await channel.declare_queue(queue_name, durable=self.durable,
-                                            exclusive=self.exclusive, *self.args, **self.kwargs)
+        queue = await channel.declare_queue(queue_name, *self.args, **self.kwargs)
         await queue.bind(direct_logs_exchange, routing_key=queue_name)
 
         await queue.consume(self.on_response)
@@ -287,11 +294,9 @@ class MicroContainer(object):
 
     """
     branchs: List[Branch] = None
-    con_url: str = ""
 
-    def __init__(self, branchs: List[Branch], con_url: str):
+    def __init__(self, branchs: List[Branch]):
         self.branchs = branchs
-        self.con_url = con_url
 
     async def service_publish(self):
         """
@@ -300,7 +305,7 @@ class MicroContainer(object):
         """
         for branch in self.branchs:
             branch: Branch
-            await branch.start(self.con_url)
+            await branch.start()
 
     def run(self):
         asyncio.ensure_future(self.service_publish())
