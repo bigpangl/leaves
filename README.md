@@ -38,7 +38,7 @@ asyncio.get_event_loop().run_forever()
 
 from leaves import Leaf, Branch, MicroContainer
 
-branch = Branch("points")
+branch = Branch("points", con_url=r"amqp://")
 
 
 @branch.leaf(timeout=10)
@@ -48,7 +48,7 @@ async def hello(*args, **kwargs):
 
 
 if __name__ == '__main__':
-    container = MicroContainer([branch], con_url=r"amqp://")
+    container = MicroContainer([branch])
 
     container.run()
 
